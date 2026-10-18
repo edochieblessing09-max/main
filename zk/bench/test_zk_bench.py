@@ -407,3 +407,134 @@ def test_published_baselines_detect_size_regression(lock: zb.Lock):
         phase["sizes"]["proof_bytes"] = 65535
     findings = zb.compare_report(report, baselines)
     assert any("proof_bytes" in f for f in findings), findings
+
+
+def test_compare_format_text_default(lock: zb.Lock, tmp_path: Path, capsys):
+    report = zb.run_target(lock, "ci", force_synthetic=True)
+    report_path = tmp_path / "ci.json"
+    zb.write_report(report, report_path, limits=lock.limits)
+
+    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "text"])
+    assert code == zb.EXIT_OK
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip()) == {"status": "ok"}
+
+
+def test_compare_format_json(lock: zb.Lock, tmp_path: Path, capsys):
+    report = zb.run_target(lock, "ci", force_synthetic=True)
+    report_path = tmp_path / "ci.json"
+    zb.write_report(report, report_path, limits=lock.limits)
+
+    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "json"])
+    assert code == zb.EXIT_OK
+    captured = capsys.readouterr()
+    res = json.loads(captured.out)
+    assert res["status"] == "ok"
+    assert res["target"] == "ci"
+    assert res["findings"] == []
+    assert len(res["metrics"]) > 0
+    zb.assert_privacy_safe(res, forbidden_keys=lock.forbidden_report_keys, forbidden_substrings=lock.forbidden_substrings)
+
+
+def test_compare_format_markdown_table(lock: zb.Lock, tmp_path: Path, capsys):
+    report = zb.run_target(lock, "ci", force_synthetic=True)
+    report_path = tmp_path / "ci.json"
+    zb.write_report(report, report_path, limits=lock.limits)
+
+    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "markdown"])
+    assert code == zb.EXIT_OK
+    captured = capsys.readouterr()
+    table = captured.out
+    assert "### Target: ci" in table
+    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in table
+    assert "| --- | --- | --- | --- | --- |" in table
+    assert "prove/p50" in table
+    assert "PASS" in table
+
+
+def test_compare_regression_formats(lock: zb.Lock, tmp_path: Path, capsys):
+    report = zb.run_target(lock, "ci", force_synthetic=True)
+    for phase in report["phases"]:
+        phase["sizes"]["proof_bytes"] = 65535
+    report_path = tmp_path / "ci_regress.json"
+    zb.write_report(report, report_path, limits=lock.limits)
+
+    # Text format
+    code_text = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "text"])
+    assert code_text == zb.EXIT_REGRESSION
+    out_text = json.loads(capsys.readouterr().out.strip())
+    assert out_text["status"] == "regression"
+
+    # Json format
+    code_json = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "json"])
+    assert code_json == zb.EXIT_REGRESSION
+    out_json = json.loads(capsys.readouterr().out)
+    assert out_json["status"] == "regression"
+    assert len(out_json["findings"]) > 0
+    assert any(m["status"] == "FAIL" for m in out_json["metrics"])
+
+    # Markdown format
+    code_md = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "markdown"])
+    assert code_md == zb.EXIT_REGRESSION
+    out_md = capsys.readouterr().out
+    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in out_md
+    assert "FAIL" in out_md
+
+
+def test_compare_summary_github_step_summary(lock: zb.Lock, tmp_path: Path, monkeypatch):
+    report = zb.run_target(lock, "ci", force_synthetic=True)
+    report_path = tmp_path / "ci.json"
+    zb.write_report(report, report_path, limits=lock.limits)
+    summary_file = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--summary"])
+    assert code == zb.EXIT_OK
+    assert summary_file.is_file()
+    content = summary_file.read_text(encoding="utf-8")
+    assert "### Target: ci" in content
+    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in content
+    assert "PASS" in content
+
+
+def test_trend_formats_and_summary(lock: zb.Lock, tmp_path: Path, monkeypatch, capsys):
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    r1 = zb.run_target(lock, "ci", force_synthetic=True)
+    zb.write_report(r1, reports_dir / "r1.json", limits=lock.limits)
+    r2 = zb.run_target(lock, "ci", force_synthetic=True)
+    zb.write_report(r2, reports_dir / "r2.json", limits=lock.limits)
+
+    # Trend text format (default json summary unchanged)
+    code_text = zb.main(["--lock", str(LOCK_PATH), "trend", "--dir", str(reports_dir), "--format", "text"])
+    assert code_text == zb.EXIT_OK
+    out_text = json.loads(capsys.readouterr().out)
+    assert out_text["targets"]["ci"]["reports"] == 2
+
+    # Trend json format
+    code_json = zb.main(["--lock", str(LOCK_PATH), "trend", "--dir", str(reports_dir), "--format", "json"])
+    assert code_json == zb.EXIT_OK
+    out_json = json.loads(capsys.readouterr().out)
+    assert out_json["targets"]["ci"]["reports"] == 2
+
+    # Trend markdown format and summary
+    summary_file = tmp_path / "trend_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+    code_md = zb.main([
+        "--lock", str(LOCK_PATH),
+        "trend",
+        "--dir", str(reports_dir),
+        "--format", "markdown",
+        "--summary"
+    ])
+    assert code_md == zb.EXIT_OK
+    out_md = capsys.readouterr().out
+    assert "### Target: ci" in out_md
+    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in out_md
+    assert "p50_ms" in out_md
+
+    assert summary_file.is_file()
+    summary_content = summary_file.read_text(encoding="utf-8")
+    assert "### Target: ci" in summary_content
+    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in summary_content
+
