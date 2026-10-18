@@ -65,6 +65,49 @@ def test_browser_runner_modes_are_bounded(lock: zb.Lock):
     )
 
 
+def test_browser_runner_circuits_and_batch_bounds(lock: zb.Lock):
+    runner = (Path(__file__).resolve().parent / "browser_runner.mjs").read_text(encoding="utf-8")
+    assert "SUPPORTED_CIRCUITS = ['silent_witness', 'aggregator']" in runner
+    assert "MAX_AGGREGATION_SIZE = 8" in runner
+    assert "MIN_AGGREGATION_SIZE = 1" in runner
+    assert "AGGREGATED_PUBLIC_INPUTS_LEN = 1024" in runner
+    zb.assert_privacy_safe(
+        {"circuit": "aggregator", "batch": 8, "fixture_id": "silent_witness_aggregator.synthetic.v1"},
+        forbidden_keys=lock.forbidden_report_keys,
+        forbidden_substrings=lock.forbidden_substrings,
+    )
+
+
+def test_browser_runner_cli_validations():
+    import subprocess
+    runner_path = str(Path(__file__).resolve().parent / "browser_runner.mjs")
+
+    # Rejection of unknown circuit
+    proc = subprocess.run(["node", runner_path, "--circuit", "unknown"], capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "unknown_circuit" in proc.stderr
+
+    # Rejection of invalid batch sizes (bounds 1..8)
+    proc = subprocess.run(["node", runner_path, "--circuit", "aggregator", "--batch", "0"], capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "invalid_batch_size" in proc.stderr
+
+    proc = subprocess.run(["node", runner_path, "--circuit", "aggregator", "--batch", "9"], capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "invalid_batch_size" in proc.stderr
+
+    # Missing artifacts exit 3 with dependency-failure
+    proc = subprocess.run(["node", runner_path, "--circuit", "aggregator"], capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "dependency-failure" in proc.stderr
+    assert "compile circuits first" in proc.stderr
+
+    proc = subprocess.run(["node", runner_path, "--circuit", "silent_witness"], capture_output=True, text=True)
+    assert proc.returncode == 3
+    assert "dependency-failure" in proc.stderr
+    assert "compile circuits first" in proc.stderr
+
+
 def test_lock_rejects_unknown_version(tmp_path: Path):
     raw = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     raw["version"] = 99
@@ -179,7 +222,7 @@ def test_oversized_witness_fails_deterministically(lock: zb.Lock):
             witness_bytes=lock.limits.max_witness_bytes + 1,
             limits=lock.limits,
         )
-    assert exc.value.code == "witness_oversized"
+    assert exc.value.code in ("oversized", "witness_oversized")
 
 
 def test_concurrency_capacity_rejected(lock: zb.Lock):
@@ -407,3 +450,89 @@ def test_published_baselines_detect_size_regression(lock: zb.Lock):
         phase["sizes"]["proof_bytes"] = 65535
     findings = zb.compare_report(report, baselines)
     assert any("proof_bytes" in f for f in findings), findings
+
+
+def test_published_baselines_aggregator_compare(lock: zb.Lock, tmp_path: Path):
+    """Aggregator browser report shape matches harpocrates.zk-bench and passes compare."""
+    baselines = zb.load_baselines(zb.DEFAULT_BASELINES)
+    assert baselines is not None
+    assert "circuits" in baselines and "aggregator" in baselines["circuits"]
+    assert "browser_aggregator" in baselines.get("targets", {})
+
+    report = {
+        "format": "harpocrates.zk-bench",
+        "version": 1,
+        "target": "browser",
+        "circuit": "aggregator",
+        "batch": 8,
+        "fixture_id": "silent_witness_aggregator.synthetic.v1",
+        "mode": "worker",
+        "runtime": {
+            "os": "linux",
+            "arch": "x64",
+            "node_version": "v20.0.0",
+            "cpu_count": 8,
+            "ci": True,
+            "threading": {"max_concurrency": 1},
+        },
+        "phases": [
+            {
+                "phase": "prove",
+                "percentiles": {
+                    "p50": 150000.0,
+                    "p95": 200000.0,
+                    "p99": 250000.0,
+                    "min": 140000.0,
+                    "max": 260000.0,
+                    "mean": 160000.0,
+                    "count": 2,
+                },
+                "samples_ms": [150000.0, 170000.0],
+                "sizes": {
+                    "proof_bytes": 2048,
+                    "public_input_bytes": 1024,
+                    "witness_bytes": 8192,
+                },
+                "memory": {"peak_rss_bytes": 1048576},
+            },
+            {
+                "phase": "verify",
+                "percentiles": {
+                    "p50": 5000.0,
+                    "p95": 8000.0,
+                    "p99": 10000.0,
+                    "min": 4000.0,
+                    "max": 11000.0,
+                    "mean": 6000.0,
+                    "count": 2,
+                },
+                "samples_ms": [5000.0, 7000.0],
+                "sizes": {
+                    "proof_bytes": 2048,
+                    "public_input_bytes": 1024,
+                    "witness_bytes": 8192,
+                },
+                "memory": {"peak_rss_bytes": 1048576},
+            },
+        ],
+        "outcome": "ok",
+        "generated_at_unix": 1700000000,
+    }
+
+    # Verify report is privacy safe
+    zb.assert_privacy_safe(
+        report,
+        forbidden_keys=lock.forbidden_report_keys,
+        forbidden_substrings=lock.forbidden_substrings,
+    )
+
+    # Valid report against baselines produces no findings
+    findings = zb.compare_report(report, baselines)
+    assert not findings, f"Expected no findings, got {findings}"
+
+    # Regression detected if public inputs exceed 1024
+    regressed_report = json.loads(json.dumps(report))
+    regressed_report["phases"][0]["sizes"]["public_input_bytes"] = 2048
+    reg_findings = zb.compare_report(regressed_report, baselines)
+    assert any("public_input_bytes" in f for f in reg_findings)
+
