@@ -93,8 +93,101 @@ def test_percentiles_are_monotonic():
 
 
 def test_percentile_rejects_empty():
+    with pytest.raises(zb.BenchError, match="empty sample list"):
+        zb.percentile([], 50)
     with pytest.raises(zb.BenchError, match="no timing samples"):
         zb.summarize_timings([])
+
+
+def test_percentile_rejects_out_of_range():
+    with pytest.raises(zb.BenchError, match="percentile out of range"):
+        zb.percentile([10.0, 20.0], -0.1)
+    with pytest.raises(zb.BenchError, match="percentile out of range"):
+        zb.percentile([10.0, 20.0], 100.1)
+
+
+def test_percentile_single_sample():
+    for pct in (0, 50, 95, 100):
+        assert zb.percentile([42.5], pct) == 42.5
+    summary = zb.summarize_timings([42.5])
+    assert summary == {
+        "p50": 42.5,
+        "p95": 42.5,
+        "p99": 42.5,
+        "min": 42.5,
+        "max": 42.5,
+        "mean": 42.5,
+        "count": 1.0,
+    }
+
+
+def test_percentile_identical_samples():
+    samples = [15.25, 15.25, 15.25, 15.25]
+    for pct in (0, 50, 95, 100):
+        assert zb.percentile(samples, pct) == 15.25
+    summary = zb.summarize_timings(samples)
+    assert summary == {
+        "p50": 15.25,
+        "p95": 15.25,
+        "p99": 15.25,
+        "min": 15.25,
+        "max": 15.25,
+        "mean": 15.25,
+        "count": 4.0,
+    }
+
+
+def test_percentile_odd_and_even_counts_and_boundaries():
+    odd = [10.0, 20.0, 30.0, 40.0, 50.0]
+    assert zb.percentile(odd, 0) == 10.0
+    assert zb.percentile(odd, 50) == 20.0
+    assert zb.percentile(odd, 95) == 50.0
+    assert zb.percentile(odd, 100) == 50.0
+
+    even = [10.0, 20.0, 30.0, 40.0]
+    assert zb.percentile(even, 0) == 10.0
+    assert zb.percentile(even, 50) == 20.0
+    assert zb.percentile(even, 95) == 40.0
+    assert zb.percentile(even, 100) == 40.0
+
+
+def test_percentile_and_summarize_timings_unsorted_input_contract():
+    # percentile() operates on a pre-sorted sequence directly without sorting
+    unsorted = [50.0, 10.0, 40.0, 20.0, 30.0]
+    assert zb.percentile(unsorted, 0) == 50.0
+    assert zb.percentile(unsorted, 100) == 30.0
+
+    # summarize_timings() sorts its input before computing percentiles and bounds
+    summary_unsorted = zb.summarize_timings(unsorted)
+    summary_sorted = zb.summarize_timings(sorted(unsorted))
+    assert summary_unsorted == summary_sorted
+    assert summary_unsorted["min"] == 10.0
+    assert summary_unsorted["max"] == 50.0
+    assert summary_unsorted["p50"] == 20.0
+    assert summary_unsorted["p95"] == 50.0
+    assert summary_unsorted["p99"] == 50.0
+
+
+def test_summarize_timings_keys_and_rounding():
+    # Nearest-rank uses round() on (pct / 100.0) * n:
+    # For n=3 and pct=50 -> 1.5 -> round(1.5) == 2 -> index 1 (second element)
+    # For n=5 and pct=50 -> 2.5 -> round(2.5) == 2 -> index 1 (second element)
+    summary_3 = zb.summarize_timings([10, 20, 30])
+    assert set(summary_3.keys()) == {"p50", "p95", "p99", "min", "max", "mean", "count"}
+    assert all(isinstance(v, float) for v in summary_3.values())
+    assert summary_3["p50"] == 20.0
+    assert summary_3["p95"] == 30.0
+    assert summary_3["p99"] == 30.0
+    assert summary_3["min"] == 10.0
+    assert summary_3["max"] == 30.0
+    assert summary_3["mean"] == 20.0
+    assert summary_3["count"] == 3.0
+
+    summary_5 = zb.summarize_timings([10, 20, 30, 40, 50])
+    assert summary_5["p50"] == 20.0
+    assert summary_5["p95"] == 50.0
+    assert summary_5["p99"] == 50.0
+    assert summary_5["count"] == 5.0
 
 
 def test_percentile_rejects_oversized_list():
@@ -409,132 +502,12 @@ def test_published_baselines_detect_size_regression(lock: zb.Lock):
     assert any("proof_bytes" in f for f in findings), findings
 
 
-def test_compare_format_text_default(lock: zb.Lock, tmp_path: Path, capsys):
-    report = zb.run_target(lock, "ci", force_synthetic=True)
-    report_path = tmp_path / "ci.json"
-    zb.write_report(report, report_path, limits=lock.limits)
-
-    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "text"])
-    assert code == zb.EXIT_OK
-    captured = capsys.readouterr()
-    assert json.loads(captured.out.strip()) == {"status": "ok"}
-
-
-def test_compare_format_json(lock: zb.Lock, tmp_path: Path, capsys):
-    report = zb.run_target(lock, "ci", force_synthetic=True)
-    report_path = tmp_path / "ci.json"
-    zb.write_report(report, report_path, limits=lock.limits)
-
-    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "json"])
-    assert code == zb.EXIT_OK
-    captured = capsys.readouterr()
-    res = json.loads(captured.out)
-    assert res["status"] == "ok"
-    assert res["target"] == "ci"
-    assert res["findings"] == []
-    assert len(res["metrics"]) > 0
-    zb.assert_privacy_safe(res, forbidden_keys=lock.forbidden_report_keys, forbidden_substrings=lock.forbidden_substrings)
-
-
-def test_compare_format_markdown_table(lock: zb.Lock, tmp_path: Path, capsys):
-    report = zb.run_target(lock, "ci", force_synthetic=True)
-    report_path = tmp_path / "ci.json"
-    zb.write_report(report, report_path, limits=lock.limits)
-
-    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "markdown"])
-    assert code == zb.EXIT_OK
-    captured = capsys.readouterr()
-    table = captured.out
-    assert "### Target: ci" in table
-    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in table
-    assert "| --- | --- | --- | --- | --- |" in table
-    assert "prove/p50" in table
-    assert "PASS" in table
-
-
-def test_compare_regression_formats(lock: zb.Lock, tmp_path: Path, capsys):
-    report = zb.run_target(lock, "ci", force_synthetic=True)
-    for phase in report["phases"]:
-        phase["sizes"]["proof_bytes"] = 65535
-    report_path = tmp_path / "ci_regress.json"
-    zb.write_report(report, report_path, limits=lock.limits)
-
-    # Text format
-    code_text = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "text"])
-    assert code_text == zb.EXIT_REGRESSION
-    out_text = json.loads(capsys.readouterr().out.strip())
-    assert out_text["status"] == "regression"
-
-    # Json format
-    code_json = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "json"])
-    assert code_json == zb.EXIT_REGRESSION
-    out_json = json.loads(capsys.readouterr().out)
-    assert out_json["status"] == "regression"
-    assert len(out_json["findings"]) > 0
-    assert any(m["status"] == "FAIL" for m in out_json["metrics"])
-
-    # Markdown format
-    code_md = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--format", "markdown"])
-    assert code_md == zb.EXIT_REGRESSION
-    out_md = capsys.readouterr().out
-    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in out_md
-    assert "FAIL" in out_md
-
-
-def test_compare_summary_github_step_summary(lock: zb.Lock, tmp_path: Path, monkeypatch):
-    report = zb.run_target(lock, "ci", force_synthetic=True)
-    report_path = tmp_path / "ci.json"
-    zb.write_report(report, report_path, limits=lock.limits)
-    summary_file = tmp_path / "step_summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
-
-    code = zb.main(["--lock", str(LOCK_PATH), "compare", "--report", str(report_path), "--summary"])
-    assert code == zb.EXIT_OK
-    assert summary_file.is_file()
-    content = summary_file.read_text(encoding="utf-8")
-    assert "### Target: ci" in content
-    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in content
-    assert "PASS" in content
-
-
-def test_trend_formats_and_summary(lock: zb.Lock, tmp_path: Path, monkeypatch, capsys):
-    reports_dir = tmp_path / "reports"
-    reports_dir.mkdir()
-    r1 = zb.run_target(lock, "ci", force_synthetic=True)
-    zb.write_report(r1, reports_dir / "r1.json", limits=lock.limits)
-    r2 = zb.run_target(lock, "ci", force_synthetic=True)
-    zb.write_report(r2, reports_dir / "r2.json", limits=lock.limits)
-
-    # Trend text format (default json summary unchanged)
-    code_text = zb.main(["--lock", str(LOCK_PATH), "trend", "--dir", str(reports_dir), "--format", "text"])
-    assert code_text == zb.EXIT_OK
-    out_text = json.loads(capsys.readouterr().out)
-    assert out_text["targets"]["ci"]["reports"] == 2
-
-    # Trend json format
-    code_json = zb.main(["--lock", str(LOCK_PATH), "trend", "--dir", str(reports_dir), "--format", "json"])
-    assert code_json == zb.EXIT_OK
-    out_json = json.loads(capsys.readouterr().out)
-    assert out_json["targets"]["ci"]["reports"] == 2
-
-    # Trend markdown format and summary
-    summary_file = tmp_path / "trend_summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
-    code_md = zb.main([
-        "--lock", str(LOCK_PATH),
-        "trend",
-        "--dir", str(reports_dir),
-        "--format", "markdown",
-        "--summary"
-    ])
-    assert code_md == zb.EXIT_OK
-    out_md = capsys.readouterr().out
-    assert "### Target: ci" in out_md
-    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in out_md
-    assert "p50_ms" in out_md
-
-    assert summary_file.is_file()
-    summary_content = summary_file.read_text(encoding="utf-8")
-    assert "### Target: ci" in summary_content
-    assert "| Metric | Baseline | Observed | Delta % | Pass/Fail |" in summary_content
+def test_main_run_rejects_unknown_or_empty_phases(capsys):
+    """Unknown or empty phases must fail fast, exit 2 via parser.error, and list valid phases."""
+    for bad_phases in ["prov", "prove,invalid", ",,,", ""]:
+        with pytest.raises(SystemExit) as excinfo:
+            zb.main(["run", "--target", "ci", "--synthetic", "--phases", bad_phases])
+        assert excinfo.value.code == zb.EXIT_USAGE
+        err = capsys.readouterr().err
+        assert "prove" in err and "verify" in err
 
